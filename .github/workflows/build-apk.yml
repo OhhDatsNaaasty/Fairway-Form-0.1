@@ -1,0 +1,96 @@
+name: Build Fairway Form APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - Fairway-Form-Source.zip
+      - .github/workflows/build-apk.yml
+concurrency:
+  group: fairway-apk-signing
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      APP_SIGNING_PASSWORD: ${{ secrets.APP_SIGNING_PASSWORD }}
+      ANDROID_STORE_PASSWORD: ${{ secrets.APP_SIGNING_PASSWORD }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.APP_SIGNING_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f Fairway-Form-Source.zip || { echo 'Upload Fairway-Form-Source.zip to the repository root first.'; exit 1; }
+          test -n "$APP_SIGNING_PASSWORD" || { echo 'Add the APP_SIGNING_PASSWORD repository secret first.'; exit 1; }
+      - name: Extract app source
+        run: |
+          unzip -q Fairway-Form-Source.zip -d source
+          test -f source/fairway-form/android/app/build.gradle
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Prepare persistent signing identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test ! -f .fairway-signing.enc; then
+            if test -n "$(git log --all --format=%H -- .fairway-signing.enc)"; then
+              echo 'The saved signing key was deleted. Restore .fairway-signing.enc from repository history.'
+              exit 1
+            fi
+            export ALLOW_NEW_SIGNING_KEY=true
+          fi
+          bash source/fairway-form/scripts/prepare-signing.sh "$GITHUB_WORKSPACE/.fairway-signing.enc"
+          if test -n "$(git status --porcelain -- .fairway-signing.enc)"; then
+            git config user.name 'Fairway Form build'
+            git config user.email 'fairway-build@users.noreply.github.com'
+            git add .fairway-signing.enc
+            git commit -m 'Save encrypted signing key for future APK updates'
+            git push
+          fi
+          echo "ORG_GRADLE_PROJECT_fairwayVersionCode=$((GITHUB_RUN_NUMBER + 1000))" >> "$GITHUB_ENV"
+      - name: Install Android SDK packages
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Check application algorithms
+        run: npm --prefix source/fairway-form test
+      - name: Download and bundle offline pose engine
+        run: npm --prefix source/fairway-form run assets
+      - name: Compile signed installable APK
+        run: bash source/fairway-form/scripts/build-android.sh assembleRelease
+      - name: Verify APK signature and contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=source/fairway-form/artifacts/Fairway-Form.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          unzip -Z1 "$APK" > "$RUNNER_TEMP/apk-contents.txt"
+          for ASSET in index.html app.js vendor/vision_bundle.mjs vendor/pose_landmarker_lite.task vendor/wasm/vision_wasm_internal.wasm; do
+            grep -Fx "assets/web/$ASSET" "$RUNNER_TEMP/apk-contents.txt" >/dev/null
+          done
+          (cd source/fairway-form/artifacts && sha256sum Fairway-Form.apk > Fairway-Form.apk.sha256)
+      - name: Downloadable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fairway-Form-APK
+          path: |
+            source/fairway-form/artifacts/Fairway-Form.apk
+            source/fairway-form/artifacts/Fairway-Form.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove unencrypted signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/fairway-signing.jks"
